@@ -1,0 +1,356 @@
+Here’s a concrete, end-to-end blueprint to run **DINOv3 → embeddings → UMAP → HDBSCAN → “what’s normal vs odd”** on **xView3 (maritime)**. It’s opinionated but lean enough to get results fast—and you can scale it later.
+
+---
+
+# 1) Project layout
+
+```
+xview3-dino/
+├─ data/
+│  ├─ raw/             # xView3 downloaded here (images + labels)
+│  ├─ tiles/           # 512x512 scene tiles (optional; see Step 3)
+│  └─ crops/           # per-vessel crops with context margin
+├─ features/
+│  ├─ dinov3_train.npy
+│  ├─ dinov3_val.npy
+│  └─ meta_train.parquet
+├─ notebooks/
+│  ├─ 01_preview.ipynb
+│  └─ 02_cluster_viz.ipynb
+├─ src/
+│  ├─ prepare_xview3.py
+│  ├─ crop_vessels.py
+│  ├─ embed_dinov3.py
+│  ├─ cluster.py
+│  └─ sample_gallery.py
+└─ env.yml
+```
+
+---
+
+# 2) Environment
+
+```bash
+conda create -n dino-pol python=3.11 -y
+conda activate dino-pol
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121  # adjust CUDA
+pip install pillow opencv-python pyarrow pandas tqdm hdbscan umap-learn matplotlib seaborn scikit-learn
+# DINOv3 (official):
+git clone https://github.com/facebookresearch/dinov3
+pip install -e dinov3
+# Optional: if you prefer a “one-liner” model load, use timm’s DINOv2 as a drop-in baseline:
+pip install timm
+```
+
+> **Note:** If you hit friction with DINOv3 checkpoints/augmentations, start with `timm`’s `vit_large_patch14_dinov2.lvd142m` to validate your pipeline; then switch to DINOv3.
+
+---
+
+# 3) Data ingestion (xView3)
+
+* xView3 ships with large scenes, SAR/EO variants, and labels (vessel boxes + attributes).
+* For this unsupervised PoL pass, we’ll:
+
+  1. **Option A (simple)**: crop around labeled vessels (positive set) + sample background crops (negatives) to anchor the embedding space.
+  2. **Option B (full scenes)**: tile scenes into 512×512 windows and embed all tiles (discover clusters like ports, open ocean, wakes, etc.). This is great for *contextual* PoL.
+
+**Tip:** Start with **Option A** (faster—hours). Add Option B later for richer PoL context.
+
+### `src/prepare_xview3.py` (reads labels, makes a Parquet index)
+
+```python
+import json, pathlib as P
+import pandas as pd
+
+ROOT = P.Path("data/raw")
+OUT  = P.Path("features")
+OUT.mkdir(parents=True, exist_ok=True)
+
+def load_annots():
+    # Adjust to xView3 annotation format you have (train/val json/csv)
+    # Expecting rows: [image_path, x1,y1,x2,y2, split, source, any attrs...]
+    recs = []
+    for split in ["train","val"]:
+        ann = ROOT/f"{split}_annotations.json"
+        j = json.loads((ann).read_text())
+        for im in j["images"]:
+            img_path = str(ROOT / im["file_name"])
+            for bb in im["boxes"]:  # adapt to schema
+                recs.append({
+                    "split": split,
+                    "img": img_path,
+                    "x1": bb["x1"], "y1": bb["y1"],
+                    "x2": bb["x2"], "y2": bb["y2"],
+                    "is_vessel": 1,
+                })
+    df = pd.DataFrame.from_records(recs)
+    df.to_parquet(OUT/"meta_boxes.parquet", index=False)
+
+if __name__ == "__main__":
+    load_annots()
+```
+
+---
+
+# 4) Crop logic (context helps!)
+
+We’ll expand each box by a margin (e.g., **1.5×** the box size) and square-pad to preserve aspect ratio. Save to `data/crops/`.
+
+```python
+# src/crop_vessels.py
+import cv2, numpy as np, pandas as pd
+import pathlib as P
+from tqdm import tqdm
+
+META = P.Path("features/meta_boxes.parquet")
+OUT  = P.Path("data/crops")
+OUT.mkdir(parents=True, exist_ok=True)
+
+MARGIN = 0.5   # 50% margin around bbox
+SIZE   = 224   # DINOv3 default is flexible; 224 keeps it quick
+
+def sq_crop(img, x1,y1,x2,y2, margin=MARGIN, out_size=SIZE):
+    h, w = img.shape[:2]
+    cx = (x1+x2)/2; cy = (y1+y2)/2
+    bw = (x2-x1); bh = (y2-y1)
+    side = int(max(bw, bh) * (1+2*margin))
+    xA = max(0, int(cx - side/2))
+    yA = max(0, int(cy - side/2))
+    xB = min(w, xA + side)
+    yB = min(h, yA + side)
+    crop = img[yA:yB, xA:xB]
+    # pad square
+    h2, w2 = crop.shape[:2]
+    pad = max(h2, w2)
+    canvas = np.zeros((pad,pad,3), dtype=crop.dtype)
+    offy = (pad - h2)//2; offx = (pad - w2)//2
+    canvas[offy:offy+h2, offx:offx+w2] = crop
+    return cv2.resize(canvas, (out_size,out_size), interpolation=cv2.INTER_AREA)
+
+def main():
+    df = pd.read_parquet(META)
+    out_rows = []
+    for i,row in tqdm(df.iterrows(), total=len(df)):
+        img = cv2.imread(row.img, cv2.IMREAD_COLOR)
+        if img is None: continue
+        crop = sq_crop(img, row.x1,row.y1,row.x2,row.y2)
+        out_path = OUT/f"{row.split}_{i:08d}.jpg"
+        cv2.imwrite(str(out_path), crop)
+        out_rows.append({"split": row.split, "path": str(out_path), "is_vessel": 1})
+    pd.DataFrame(out_rows).to_parquet("features/meta_crops.parquet", index=False)
+
+if __name__ == "__main__":
+    main()
+```
+
+> You can add **background negatives** by uniform/random sampling windows with *no* overlap with vessel boxes; mark `is_vessel=0`. This helps HDBSCAN separate “empty sea,” “coastline,” “wake,” etc.
+
+---
+
+# 5) DINOv3 embeddings
+
+Two routes:
+
+### A) **Official DINOv3** (best fidelity)
+
+* Load the checkpoint you want (e.g., ViT-L/14).
+* Use the repo’s `vision_transformer.py` and augmentation config.
+* Extract the **\[CLS] token** (common) or pooled patch tokens.
+
+### B) **Timm DINOv2** (quick sanity check)
+
+* `timm.create_model("vit_large_patch14_dinov2.lvd142m", pretrained=True)`
+* Embedding dim = 1024 (L/14).
+
+Below is **DINOv3-style** usage with an adapter; if you prefer, swap the model block with the timm one-liner.
+
+```python
+# src/embed_dinov3.py
+import torch, pandas as pd, numpy as np
+from PIL import Image
+from torchvision import transforms
+from tqdm import tqdm
+import pathlib as P
+
+# ---- Option B: swap to timm if you prefer quick start ----
+USE_TIMM = False
+
+if USE_TIMM:
+    import timm
+    model = timm.create_model("vit_large_patch14_dinov2.lvd142m", pretrained=True)
+    embed_dim = model.num_features
+    model.reset_classifier(0)
+else:
+    # Minimal DINOv3 loader
+    import dinov3
+    from dinov3.dinov3 import build_model_from_cfg
+    # Choose a cfg + checkpoint you’ve downloaded per DINOv3 README
+    cfg = dinov3.get_cfg("dinov3_vitl14")  # example name; adapt to your ckpt
+    model = build_model_from_cfg(cfg)
+    ckpt = torch.load("dinov3/weights/dinov3_vitl14.pth", map_location="cpu")
+    model.load_state_dict(ckpt["model"], strict=False)
+    embed_dim = model.embed_dim  # depending on implementation
+
+model.eval().cuda()
+
+T = transforms.Compose([
+    transforms.ToTensor(),                               # [0,1]
+    transforms.Normalize(mean=(0.485,0.456,0.406),
+                         std=(0.229,0.224,0.225)),
+])
+
+META = P.Path("features/meta_crops.parquet")
+DF = pd.read_parquet(META)
+BATCH = 256
+paths = DF["path"].tolist()
+
+def batch_paths(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+all_feats = []
+with torch.no_grad():
+    for chunk in tqdm(list(batch_paths(paths, BATCH))):
+        imgs = []
+        for p in chunk:
+            img = Image.open(p).convert("RGB")
+            imgs.append(T(img))
+        x = torch.stack(imgs, 0).cuda()
+        # Forward – adapt if your DINOv3 returns tuple/dict
+        y = model(x)                 # shape [B, D] (CLS), depending on wrapper
+        if isinstance(y, (list,tuple)): y = y[0]
+        feats = y.detach().cpu().float().numpy()
+        all_feats.append(feats)
+
+FEATS = np.concatenate(all_feats, axis=0)
+np.save("features/dinov3_train.npy", FEATS)  # for train split; repeat for val
+DF.to_parquet("features/meta_train.parquet", index=False)
+```
+
+**Sanity check:** run PCA on a small sample; you should see clear separation between “ocean” vs “cluttered/near-shore” backgrounds and some vessel morphology clusters.
+
+---
+
+# 6) Dimensionality reduction + HDBSCAN
+
+I recommend **UMAP → HDBSCAN** (UMAP preserves local neighborhoods well for imagery).
+
+```python
+# src/cluster.py
+import numpy as np, pandas as pd
+import umap, hdbscan
+from sklearn.metrics import silhouette_score
+import matplotlib.pyplot as plt
+
+X = np.load("features/dinov3_train.npy")
+meta = pd.read_parquet("features/meta_train.parquet")
+
+um = umap.UMAP(n_neighbors=30, min_dist=0.0, n_components=2, metric="cosine", random_state=42)
+Z = um.fit_transform(X)
+
+clusterer = hdbscan.HDBSCAN(min_cluster_size=50, min_samples=10,
+                            metric='euclidean', cluster_selection_method='eom')
+labels = clusterer.fit_predict(Z)
+
+meta["cluster"] = labels
+meta["outlier_score"] = clusterer.outlier_scores_
+meta.to_parquet("features/clustered.parquet", index=False)
+
+# Quick viz
+plt.figure(figsize=(8,7))
+mask = labels!=-1
+plt.scatter(Z[~mask,0], Z[~mask,1], s=3, alpha=0.3, label="noise/outliers")
+plt.scatter(Z[mask,0], Z[mask,1], s=4, alpha=0.8, c=labels[mask], cmap="tab20", label="clusters")
+plt.legend(); plt.title("UMAP + HDBSCAN on DINOv3 embeddings")
+plt.show()
+
+# Optional: silhouette (ignores noise=-1)
+valid = labels!=-1
+if valid.sum() > 1 and len(np.unique(labels[valid]))>1:
+    print("Silhouette:", silhouette_score(X[valid], labels[valid], metric="cosine"))
+```
+
+**Interpreting results**
+
+* **labels = -1** → noise/anomalies. Sort by `outlier_score` descending to review the strangest crops first.
+* Clusters often organize by **appearance/scale/wake/near-shore context**. With negatives present, you’ll also see “pure background” clusters.
+
+---
+
+# 7) Rapid qualitative review (cluster gallery)
+
+```python
+# src/sample_gallery.py
+import pandas as pd, numpy as np, pathlib as P, cv2
+from math import ceil
+
+meta = pd.read_parquet("features/clustered.parquet")
+out_dir = P.Path("features/galleries"); out_dir.mkdir(exist_ok=True, parents=True)
+
+def montage(img_paths, ncol=10, size=224):
+    n = len(img_paths); nrow = ceil(n/ncol)
+    canvas = np.zeros((nrow*size, ncol*size, 3), dtype=np.uint8)
+    for i,p in enumerate(img_paths[:nrow*ncol]):
+        r, c = i//ncol, i%ncol
+        im = cv2.imread(p)
+        if im is None: continue
+        im = cv2.resize(im, (size,size))
+        canvas[r*size:(r+1)*size, c*size:(c+1)*size] = im
+    return canvas
+
+for cid in sorted(meta.cluster.unique()):
+    if cid == -1: continue
+    samp = meta[meta.cluster==cid].sample(min(200, (meta.cluster==cid).sum()), random_state=0)
+    canvas = montage(samp.path.tolist(), ncol=20, size=112)
+    cv2.imwrite(str(out_dir/f"cluster_{cid:03d}.jpg"), canvas)
+
+# Outliers gallery:
+outliers = meta.sort_values("outlier_score", ascending=False).head(400)
+cv2.imwrite(str(out_dir/"outliers_top400.jpg"),
+            montage(outliers.path.tolist(), ncol=20, size=112))
+```
+
+Open the JPGs—this is where the PoL insights pop visually.
+
+---
+
+# 8) Turning clusters into PoL signals
+
+Once you see stable visual clusters, you can:
+
+* **Name clusters** (semi-supervised): “longliner?”, “tanker”, “small craft”, “wake-heavy”, “near-port clutter”.
+* **Construct PoL features**: For each scene/time window, compute the **mix** of cluster IDs present, entropy, rarity, fraction of anomalies.
+
+  * Over time, plot these features per region (shipping lane, EEZ boundary, fishing ground).
+  * Spikes in **outlier fraction** or the sudden appearance of a rare cluster can flag **unusual activity**.
+* **Bridge to behavior**: If you have AIS tracks aligned to images, you can attach **speed/course change** stats to each crop and re-cluster with a joint embedding (e.g., concatenate z-score’d metadata to the DINO features, then UMAP+HDBSCAN again).
+
+---
+
+# 9) Practical tips & good defaults
+
+* **Batching**: 256 crops/batch on a 24GB GPU for ViT-L/14 is usually fine; reduce if you OOM.
+* **Resolution**: 224 is a good start; 336 can help with tiny vessels but costs more.
+* **Negatives**: Sample 1–2 background crops per vessel crop from the same scene.
+* **UMAP**: `n_neighbors=30, min_dist=0.0, metric='cosine'` tends to work well on ViT embeddings.
+* **HDBSCAN**: start with `min_cluster_size=50, min_samples=10`. If you get too many tiny clusters, increase `min_cluster_size`.
+* **Stability**: Fix `random_state` in UMAP for reproducibility while you iterate.
+* **Eval**: Track cluster counts, %outliers, silhouette, and a small **human-labeled audit set** to measure “purity” (how often “same cluster ≈ same thing”).
+
+---
+
+# 10) Roadmap extensions (optional but powerful)
+
+* **Option B (tiles)**: Tile full scenes (e.g., 512×512 with stride 256); embed and cluster. You’ll discover **ports, shorelines, lanes, wakes**—great for **contextual PoL**.
+* **Multi-modal**: Fuse AIS (speed, course, loitering) by concatenating normalized numeric features to DINO embeddings before UMAP.
+* **Self-labeling**: Pick the 2–3 most coherent clusters, train a **linear probe** (logistic reg) on top of the frozen DINO features; iterate.
+* **Active learning**: Manually relabel the top outliers each week; retrain a one-vs-rest probe to catch similar oddities sooner.
+* **Temporal drift**: Track cluster distribution drift over time per region (e.g., Jensen–Shannon divergence).
+
+---
+
+Other possible ideas:
+
+* Adapt the scripts to your **exact xView3 annotation schema** (some releases differ),
+* Swap in a ready-to-run **timm DINOv2** version while you fetch DINOv3 weights,
+* Or add a quick **Streamlit** app to browse clusters/outliers with thumbnails and metadata.
